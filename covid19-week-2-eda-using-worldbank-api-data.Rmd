@@ -1,0 +1,548 @@
+---
+title: "COVID-19 forecasting (week 2): visualize data from worldbank api"
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_document:
+    keep_md: true
+editor_options:
+  chunk_output_type: console
+---
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>"
+)
+```
+
+# APIs
+
+## data.worldbank.org  
+
+Set of indicators: https://data.worldbank.org/indicator  
+API documentation: https://datahelpdesk.worldbank.org/knowledgebase/articles/898581-api-basic-call-structures  
+
+## restcountries.eu 
+
+API URL: https://restcountries.eu/
+
+# Data loading
+
+```{r}
+library(data.table)
+
+# set datadir
+#datadir <- exdir
+datadir <- "../input/covid19-global-forecasting-week-2/"
+
+# iterate over our csv files and append them to dataset
+for (i in list.files(
+  path = datadir,
+  pattern = ".csv$"
+)) {
+  assign(
+    i,
+    data.table::fread(
+    input = paste0(datadir, i),
+    stringsAsFactors = T
+  )
+  )
+}
+invisible(gc())
+```
+
+# Combine data
+
+```{r}
+# add type column
+train.csv[, type := "train"]
+test.csv[, type := "test"]
+colnames(test.csv)[1] <- "Id"
+
+# combine data
+dataset <- data.table::rbindlist(
+  l = list(train.csv, test.csv),
+  fill = T
+)
+
+# delete unneeded columns, transform date
+dataset[, date := as.Date(as.character(Date))
+  ][
+    , state := get("Province_State")
+  ][
+    , country := get("Country_Region")
+  ][
+    , c("Province_State", "Country_Region", "Date") := NULL
+  ]
+```
+
+# Create features
+
+## Query gerenal data on countries
+
+```{r results='hide'}
+# create clean_country_names function
+clean_country_names <- function(c) {
+  if (c == "Congo (Brazzaville)") {
+    c <- "Congo"
+  } else if (c == "Congo (Kinshasa)") {
+    c <- "Congo (Democratic Republic of the)"
+  } else if (c == "Czechia") {
+    c <- "Czech Republic"
+  } else if (c == "Gambia, The") {
+    c <- "Gambia"
+  } else if (c == "The Gambia") {
+    c <- "Gambia"
+  } else if (c == "Korea, South") {
+    c <- "Korea (Democratic People's Republic of)"
+  } else if (c == "North Macedonia") {
+    c <- "Macedonia (the former Yugoslav Republic of)"
+  } else if (c == "Republic of the Congo") {
+    c <- "Congo (Democratic Republic of the)"
+  } else if (c == "Taiwan*") {
+    c <- "Taiwan"
+  } else if (c == "Venezuela") {
+    c <- "Venezuela (Bolivarian Republic of)"
+  } else if (c == "Bolivia") {
+    c <- "Bolivia (Plurinational State of)"
+  } else if (c == "Brunei") {
+    c <- "Brunei Darussalam"
+  } else if (c == "Cote d'Ivoire") {
+    c <- "Côte d'Ivoire"
+  } else if (c == "Eswatini") {
+    c <- "Swaziland"
+  } else if (c == "Iran") {
+    c <- "Iran (Islamic Republic of)"
+  } else if (c == "Kosovo") {
+    c <- "Republic of Kosovo"
+  } else if (c == "Moldova") {
+    c <- "Moldova (Republic of)"
+  } else if (c == "Reunion") {
+    c <- "Réunion"
+  } else if (c == "Russia") {
+    c <- "Russian Federation"
+  } else if (c == "Tanzania") {
+    c <- "Tanzania, United Republic of"
+  } else if (c == "The Bahamas") {
+    c <- "Bahamas"
+  } else if (c == "US") {
+    c <- "United States of America"
+  } else if (c == "United Kingdom") {
+    c <- "United Kingdom of Great Britain and Northern Ireland"
+  } else if (c == "Vietnam") {
+    c <- "Viet Nam"
+  }
+  return(c)
+}
+
+# apply clean_country_names function to work with REST API
+# https://restcountries.eu/
+dataset[, country := as.character(country)]
+dataset[, country := sapply(country, function(x) { clean_country_names(x) })]
+dataset[, country := factor(country)]
+
+# sort data
+dataset <- dataset[order(date)]
+stopifnot(!is.unsorted(dataset$date))
+
+# transform data as integer
+dataset[, ("d") := as.integer(factor(date))]
+
+# get countryinformation from api
+country_data <- data.table::data.table()
+
+for (c in sort(unique(as.character(dataset$country)))) {
+  print(c)
+
+  if (c %in% c("Diamond Princess", "Cruise Ship")) {
+    next
+  }
+
+  # get payload from REST API: https://restcountries.eu/
+  url <- paste0("https://restcountries.eu/rest/v2/name/", c)
+
+  req <- httr::GET(url)
+
+  if (req$status_code == 200) {
+
+    payload <- data.table::as.data.table(
+      jsonlite::fromJSON(
+        txt = httr::content(req, "text"),
+        simplifyVector = T
+      )
+    )
+
+  # append country information
+  country_data <- data.table::rbindlist(
+    l = list(
+      country_data,
+      payload[name == c, .(name, region, subregion, population, area, alpha3Code)]
+
+    ),
+    fill = TRUE
+  )
+  } else {
+    message(paste0("Error occured fetching ", c))
+  }
+}
+
+# check if all countries but the cruise ship have been found
+setdiff(unique(country_data$name), dataset[, sort(unique(as.character(get("country"))))])
+
+# create population density feature
+country_data[, pop_density := round(population / area, 4)][
+  , region := factor(region)
+  ][
+    , subregion := factor(subregion)
+    ]
+```
+
+## Query worldbank data on countries
+
+```{r results='hide'}
+api_url_base <- "http://api.worldbank.org/v2/country/"
+api_url_indicators <- "/indicator/"
+api_url_suffix <- "?source=2&mrnev=1&format=json"
+
+indicators <- list(
+  "AG.LND.AGRI.ZS" = list(name = "Agricultural land (% of land area)", log = FALSE)
+  , "SP.RUR.TOTL.ZS" = list(name = "Rural population (% of total population)", log = FALSE)
+  , "SH.TBS.INCD" = list(name = "Incidence of tuberculosis (per 100,000 people)", log = FALSE)
+  , "SH.STA.MMRT" = list(name = "Maternal mortality ratio (modeled estimate, per 100,000 live births)", log = FALSE)
+  , "SH.DYN.MORT" = list(name = "Mortality rate, under-5 (per 1,000 live births)", log = FALSE)
+  , "EG.USE.ELEC.KH.PC" = list(name = "Electric power consumption (kWh per capita)", log = TRUE)
+  , "SP.POP.GROW" = list(name = "Population growth (annual %)", log = FALSE)
+  , "EN.URB.MCTY.TL.ZS" = list(name = "Population in urban agglomerations of more than 1 million (% of total population)", log = FALSE)
+  , "SH.STA.MALN.ZS" = list(name = "Prevalence of underweight, weight for age (% of children under 5)", log = FALSE)
+  , "SP.URB.TOTL.IN.ZS" = list(name = "Urban population (% of total population)", log = FALSE)
+  , "NE.EXP.GNFS.ZS" = list(name = "Exports of goods and services (% of GDP)", log = FALSE)
+  , "NY.GDP.MKTP.CD" = list(name = "GDP (current US$)", log = TRUE)
+  , "NY.GDP.PCAP.CD" = list(name = "GDP per capita (current US$)", log = TRUE)
+  , "NY.GDP.PCAP.KD.ZG" = list(name = "GDP per capita growth (annual %)", log = FALSE)
+  , "NE.IMP.GNFS.ZS" = list(name = "Imports of goods and services (% of GDP)", log = FALSE)
+  , "SP.POP.0014.TO.ZS" = list(name = "Population ages 0-14 (% of total population)", log = FALSE)
+  , "SP.POP.1564.TO.ZS" = list(name = "Population ages 15-64 (% of total population)", log = FALSE)
+  , "SP.POP.65UP.TO.ZS" = list(name = "Population ages 65 and above (% of total population)", log = FALSE)
+  , "EG.ELC.ACCS.ZS" = list(name = "Access to electricity (% of population)", log = FALSE)
+  , "EN.ATM.PM25.MC.M3" = list(name = "PM2.5 air pollution, mean annual exposure (micrograms per cubic meter)", log = TRUE)
+  , "EN.ATM.PM25.MC.ZS" = list(name = "PM2.5 air pollution, population exposed to levels exceeding WHO guideline value (% of total)", log = FALSE)
+  , "EN.POP.SLUM.UR.ZS" = list(name = "Population living in slums (% of urban population)", log = FALSE)
+  , "EN.ATM.GHGT.KT.CE" = list(name = "Total greenhouse gas emissions (kt of CO2 equivalent)", log = TRUE)
+  , "SP.DYN.IMRT.IN" = list(name = "Mortality rate, infant (per 1,000 live births)", log = FALSE)
+  , "SH.DYN.NMRT" = list(name = "Mortality rate, neonatal (per 1,000 live births)", log = FALSE)
+  , "SH.SGR.PROC.P5" = list(name = "Number of surgical procedures (per 100,000 population)", log = FALSE)
+  , "SP.POP.TOTL.FE.ZS" = list(name = "Population, female (% of total population)", log = FALSE)
+  , "SN.ITK.DEFC.ZS" = list(name = "Prevalence of undernourishment (% of population)", log = FALSE)
+  , "SH.STA.WAST.ZS" = list(name = "Prevalence of wasting, weight for height (% of children under 5)", log = FALSE)
+  , "SH.MED.SAOP.P5" = list(name = "Specialist surgical workforce (per 100,000 population)", log = FALSE)
+  , "IS.AIR.DPRT" = list(name = "Air transport, registered carrier departures worldwide", log = TRUE)
+  , "IS.SHP.GOOD.TU" = list(name = "Container port traffic (TEU: 20 foot equivalent units)", log = TRUE)
+  , "ST.INT.XPND.MP.ZS" = list(name = "International tourism, expenditures (% of total imports)", log = FALSE)
+  , "ST.INT.RCPT.XP.ZS" = list(name = "International tourism, receipts (% of total exports)", log = FALSE)
+  , "LP.LPI.OVRL.XQ" = list(name = "Logistics performance index: Overall (1=low to 5=high)", log = FALSE)
+  , "TX.VAL.TECH.MF.ZS" = list(name = "High-technology exports (% of manufactured exports)", log = FALSE)
+  , "EN.URB.LCTY.UR.ZS" = list(name = "Population in the largest city (% of urban population)", log = FALSE)
+  , "SP.DYN.CBRT.IN" = list(name = "Birth rate, crude (per 1,000 people)", log = FALSE)
+  , "SH.DTH.COMM.ZS" = list(name = "Cause of death, by communicable diseases and maternal, prenatal and nutrition conditions (% of total)", log = FALSE)
+  , "SH.STA.DIAB.ZS" = list(name = "Diabetes prevalence (% of population ages 20 to 79)", log = FALSE)
+  , "SH.MED.BEDS.ZS" = list(name = "Hospital beds (per 1,000 people)", log = FALSE)
+  , "SH.IMM.IDPT" = list(name = "Immunization, DPT (% of children ages 12-23 months)", log = FALSE)
+  , "SH.IMM.MEAS" = list(name = "Immunization, measles (% of children ages 12-23 months)", log = FALSE)
+  , "SH.STA.BRTC.ZS" = list(name = "Births attended by skilled health staff (% of total)", log = FALSE)
+)
+
+extract_request <- function(request) {
+  payload <- jsonlite::fromJSON(
+        txt = httr::content(request, "text"),
+        simplifyVector = T
+      )
+
+  if (length(payload) != 2) {
+    message(paste0("Error occured with ", c))
+    return(NULL)
+  }
+
+  dat <- data.table::data.table(payload[[2]])
+  return(dat)
+}
+
+# get worldbank information from api
+worldbank_data <- data.table::data.table()
+
+for (c in sort(unique(as.character(country_data$alpha3Code)))) {
+  print(c)
+
+  if (c == "") {
+    next
+  }
+
+  # get payload from REST API:
+  url <- paste0(
+    api_url_base,
+    c,
+    api_url_indicators,
+    paste(names(indicators), collapse = ";"),
+    api_url_suffix
+  )
+
+  request_error <- FALSE
+
+  req <- httr::GET(url)
+
+  if (req$status_code != 200) {
+    Sys.sleep(1)
+    req <- httr::GET(url)
+    if (req$status_code != 200) {
+      request_error <- TRUE
+    }
+  }
+
+
+  if (!request_error) {
+
+    dat <- extract_request(req)
+
+    if (!is.null(dat)) {
+    worldbank_data <- data.table::rbindlist(
+      list(
+        worldbank_data,
+        dat[, c(
+          "indicator.id", "countryiso3code", "date", "value"
+        ), with = F]
+      ),
+      fill = T
+    )
+    } else {
+      message(paste0("Error occured fetching ", c, " --> req is.null"))
+    }
+  } else {
+    message(paste0("Error occured fetching ", c))
+  }
+}
+
+# check if all countries but the cruise ship have been found
+setdiff(unique(country_data$alpha3Code), unique(worldbank_data$countryiso3code))
+
+# dcast worlbank_data -> we do not use the date here since we queried the latests value available
+dcast_worldbank <- data.table::dcast(
+  data = worldbank_data,
+  formula = countryiso3code ~ indicator.id,
+  value.var = "value"
+)
+
+
+# merge worldbank data to country data
+country_data <- data.table::merge.data.table(
+  x = country_data,
+  y = dcast_worldbank,
+  by.x = "alpha3Code",
+  by.y = "countryiso3code",
+  suffixes = c("", ""),
+  all.x = TRUE
+)
+
+# remove alpha3cd
+country_data[, alpha3Code := NULL]
+```
+
+
+```{r results='hide'}
+# merge country data to dataset
+vec <- setdiff(colnames(country_data), c("area"))
+dataset <- data.table::merge.data.table(
+  x = dataset,
+  y = country_data[, (vec), with = F],
+  by.x = "country",
+  by.y = "name",
+  all.x = T,
+  suffixes = c("", "")
+)
+
+
+# create days from first case feature
+dataset[, days_from_first_case := NA_integer_]
+dataset[ConfirmedCases > 0 | is.na(ConfirmedCases),
+  days_from_first_case := as.integer(factor(date)), by = c("country", "state")
+]
+dataset[ConfirmedCases == 0, days_from_first_case := as.integer(0)]
+
+# Missings
+sapply(dataset, function(x) sum(is.na(x)))
+
+rm(train.csv, test.csv); invisible(gc())
+```
+
+# Exploratory data analysis / visualization
+
+```{r}
+# list of variables to visualize
+viz_data <- c(
+  list(
+    "pop_density" = list(name = "Population density", log = TRUE)
+    ),
+  indicators
+  )
+```
+
+## ConfirmedCases
+
+```{r}
+aggr_data <- dataset[type == "train" & days_from_first_case > 0, c(
+  "country", "days_from_first_case", names(viz_data), "ConfirmedCases"
+), with = F]
+aggr_data[, ConfirmedCases := sum(ConfirmedCases), by = c("country", "days_from_first_case")]
+aggr_data <- unique(aggr_data)
+
+frmLast <- aggr_data[aggr_data[, .I[days_from_first_case == max(days_from_first_case)], by = c("country")]$V1]
+
+annotate_data <- frmLast[order(ConfirmedCases, decreasing = T)][1:10, ]
+annotate_data <- data.table::rbindlist(
+  l = list(
+    annotate_data,
+    frmLast[days_from_first_case > 40,]
+  )
+)
+annotate_data <- annotate_data[!duplicated(annotate_data), ]
+
+for (n in names(viz_data)) {
+  p <- ggplot2::ggplot(
+    data = aggr_data,
+    ggplot2::aes_string(
+      x = "days_from_first_case",
+      y = "ConfirmedCases",
+      group = "country"
+    )
+  )
+
+  if (viz_data[[n]]$log) {
+    p <- p + ggplot2::geom_line(
+      mapping = ggplot2::aes(color = log(eval(parse(text = n))))
+    )
+
+    legend_name <- paste0("log(", n, ")")
+  } else {
+    p <- p + ggplot2::geom_line(
+      mapping = ggplot2::aes(color = eval(parse(text = n)))
+    )
+    legend_name <- n
+  }
+
+  p <- p + ggplot2::scale_color_gradient(
+    name = legend_name,
+    low = "green",
+    high = "red"
+  ) +
+  ggplot2::labs(
+    title = "ConfirmedCases since 1st case",
+    ylab = "log(ConfirmedCases)"
+  ) +
+  ggplot2::labs(
+    title = "ConfirmedCases since 1st case",
+    subtitle = paste0("Color scale: ", viz_data[[n]]$name)
+  ) +
+  ggplot2::scale_y_continuous(
+    trans = "log2"
+  )
+
+  p <- p + ggplot2::geom_point(
+    data = annotate_data,
+    ggplot2::aes(
+        x = days_from_first_case,
+        y = ConfirmedCases,
+        color = eval(parse(text = legend_name))
+        )
+  ) + ggrepel::geom_label_repel(
+      data = annotate_data,
+      ggplot2::aes(
+        x = days_from_first_case,
+        y = ConfirmedCases,
+        label = country,
+        color = eval(parse(text = legend_name))
+        ),
+      size = 2.8
+    )
+  print(p)
+}
+```
+
+
+## Fatalities
+
+```{r}
+aggr_data <- dataset[type == "train" & days_from_first_case > 0, c(
+  "country", "days_from_first_case", names(viz_data), "Fatalities"
+), with = F]
+aggr_data[, Fatalities := sum(Fatalities), by = c("country", "days_from_first_case")]
+aggr_data <- unique(aggr_data)
+
+frmLast <- aggr_data[aggr_data[, .I[days_from_first_case == max(days_from_first_case)], by = c("country")]$V1]
+
+annotate_data <- frmLast[order(Fatalities, decreasing = T)][1:10, ]
+annotate_data <- data.table::rbindlist(
+  l = list(
+    annotate_data,
+    frmLast[days_from_first_case > 40,]
+  )
+)
+annotate_data <- annotate_data[!duplicated(annotate_data), ]
+
+for (n in names(viz_data)) {
+  p <- ggplot2::ggplot(
+    data = aggr_data,
+    ggplot2::aes_string(
+      x = "days_from_first_case",
+      y = "Fatalities",
+      group = "country"
+    )
+  )
+
+  if (viz_data[[n]]$log) {
+    p <- p + ggplot2::geom_line(
+      mapping = ggplot2::aes(color = log(eval(parse(text = n))))
+    )
+
+    legend_name <- paste0("log(", n, ")")
+  } else {
+    p <- p + ggplot2::geom_line(
+      mapping = ggplot2::aes(color = eval(parse(text = n)))
+    )
+    legend_name <- n
+  }
+
+  p <- p + ggplot2::scale_color_gradient(
+    name = legend_name,
+    low = "green",
+    high = "red"
+  ) +
+  ggplot2::labs(
+    title = "Fatalities since 1st case",
+    ylab = "log(Fatalities)"
+  ) +
+  ggplot2::labs(
+    title = "Fatalities since 1st case",
+    subtitle = paste0("Color scale: ", viz_data[[n]]$name)
+  ) +
+  ggplot2::scale_y_continuous(
+    trans = "log2"
+  )
+
+  p <- p + ggplot2::geom_point(
+    data = annotate_data,
+    ggplot2::aes(
+        x = days_from_first_case,
+        y = Fatalities,
+        color = eval(parse(text = legend_name))
+        )
+  ) + ggrepel::geom_label_repel(
+      data = annotate_data,
+      ggplot2::aes(
+        x = days_from_first_case,
+        y = Fatalities,
+        label = country,
+        color = eval(parse(text = legend_name))
+        ),
+      size = 2.8
+    )
+  print(p)
+}
+```
